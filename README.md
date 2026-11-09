@@ -35,6 +35,7 @@ Senza Npcap si può provare con una cattura finta: `python make_sample.py`, poi 
 
 - Vede solo il traffico del PC su cui gira, più broadcast e multicast della rete locale.
 - Il contenuto cifrato resta cifrato: si leggono solo i metadati (nomi DNS, SNI, porte, volumi).
+- Nella cattura dal vivo, per dare un nome ai server gli IP contattati vengono inviati a Team Cymru (`whois.cymru.com`, in chiaro) e al proprio server DNS. L'analisi di un `.pcap` non fa richieste in rete.
 - Il servizio è dedotto dalla porta, quindi può sbagliare su porte non standard.
 
 Usalo solo su reti tue o dove sei autorizzato.

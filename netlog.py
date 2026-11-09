@@ -15,11 +15,13 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import queue
 import socket
 import sys
 import threading
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -34,6 +36,7 @@ SERVICES = {
     22: ("accesso remoto sicuro (SSH)", False),
     23: ("accesso remoto Telnet", True),
     25: ("invio posta (SMTP)", True),
+    43: ("ricerca del proprietario di un indirizzo (WHOIS)", False),
     53: ("ricerca indirizzi (DNS)", False),
     67: ("assegnazione indirizzo di rete (DHCP)", False),
     68: ("assegnazione indirizzo di rete (DHCP)", False),
@@ -132,6 +135,68 @@ class ProcessLookup:
         return self.table.get(key)
 
 
+def cymru_owners(ips: list[str]) -> dict[str, str]:
+    """Chiede a Team Cymru (whois.cymru.com) quale rete possiede ogni IP, in una sola richiesta."""
+    request = "begin\nverbose\n" + "\n".join(ips) + "\nend\n"
+    with socket.create_connection(("whois.cymru.com", 43), timeout=10) as s:
+        s.sendall(request.encode())
+        data = b""
+        while chunk := s.recv(4096):
+            data += chunk
+    owners = {}
+    for line in data.decode("utf-8", "replace").splitlines():
+        # AS | IP | prefisso | paese | registro | data | nome della rete
+        fields = [f.strip() for f in line.split("|")]
+        if len(fields) == 7 and fields[0] != "NA":
+            owners[fields[1]] = fields[6]
+    return owners
+
+
+class OwnerLookup:
+    """IP pubblico -> chi lo gestisce (rete proprietaria + DNS inverso).
+
+    Lavora in thread separati per non rallentare la cattura. Nota: gli IP contattati
+    vengono inviati a Team Cymru e al proprio server DNS.
+    """
+
+    def __init__(self) -> None:
+        self.labels: dict[str, str | None] = {}
+        self.pending: queue.Queue[str] = queue.Queue()
+        self.pool = ThreadPoolExecutor(max_workers=8)
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def get(self, ip: str) -> str | None:
+        if ip not in self.labels:
+            self.labels[ip] = None
+            self.pending.put(ip)
+        return self.labels[ip]
+
+    def run(self) -> None:
+        while True:
+            ips = [self.pending.get()]
+            time.sleep(1)                      # raccoglie piu' indirizzi in una sola richiesta
+            while not self.pending.empty():
+                ips.append(self.pending.get())
+            try:
+                owners = cymru_owners(ips)
+            except OSError:
+                owners = {}
+            for ip in ips:
+                owner = owners.get(ip)
+                if owner:
+                    self.labels[ip] = f"server della rete {owner} ({ip})"
+                self.pool.submit(self.reverse_dns, ip, owner)
+
+    def reverse_dns(self, ip: str, owner: str | None) -> None:
+        try:
+            host = socket.gethostbyaddr(ip)[0]
+        except OSError:
+            return
+        if not host.strip("."):                # alcuni server rispondono con un nome vuoto
+            return
+        self.labels[ip] = f"{host} (rete {owner})" if owner else host
+
+
 class NetLog:
     def __init__(self, live: bool, json_path: str | None) -> None:
         self.lock = threading.Lock()
@@ -144,6 +209,7 @@ class NetLog:
         self.totals: dict[tuple[str, str, str], list[int]] = defaultdict(lambda: [0, 0])
         self.events: list[dict] = []
         self.procs = ProcessLookup() if live else None
+        self.owners = OwnerLookup() if live else None    # un pcap si analizza senza toccare la rete
         self.json = open(json_path, "a", encoding="utf-8") if json_path else None
         self.now = time.time()
 
@@ -206,7 +272,8 @@ class NetLog:
             return "tutta la rete locale"
         if addr.is_private or addr.is_link_local:
             return f"dispositivo locale {ip}"
-        return f"server sconosciuto {ip}"
+        owner = self.owners.get(ip) if self.owners and addr.is_global else None
+        return owner or f"server sconosciuto {ip}"
 
     def learn_dns(self, dns) -> None:
         if not dns.qr or not dns.ancount:

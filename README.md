@@ -24,7 +24,10 @@ Per la cattura dal vivo serve [Npcap](https://npcap.com) e un terminale avviato 
 .\.venv\Scripts\python netlog.py                       # cattura dal vivo
 .\.venv\Scripts\python netlog.py --pcap file.pcap      # analizza una cattura salvata
 .\.venv\Scripts\python netlog.py --json eventi.jsonl   # salva anche gli eventi in JSON Lines
+.\.venv\Scripts\python netlog.py --ui                  # pagina web locale su http://127.0.0.1:8765
 ```
+
+La pagina (`ui.html`) mostra gli avvisi, i programmi che usano la rete con le loro destinazioni e i dispositivi visti. È raggiungibile solo dal PC su cui gira netlog.
 
 Senza Npcap si può provare con una cattura finta: `python make_sample.py`, poi `--pcap sample.pcap`.
 

@@ -6,6 +6,7 @@ Uso:
     python netlog.py --iface "Wi-Fi"        cattura da un'interfaccia precisa
     python netlog.py --pcap file.pcap       analizza una cattura salvata (es. da Wireshark)
     python netlog.py --json eventi.jsonl    salva anche gli eventi in formato JSON Lines
+    python netlog.py --ui                   mostra tutto in una pagina web locale
 
 Pipeline:  pacchetto -> conversazione -> arricchimento (nome, processo, servizio) -> frase.
 """
@@ -20,6 +21,8 @@ import threading
 import time
 from collections import defaultdict
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import psutil
 from scapy.all import ARP, DNS, ICMP, IP, TCP, UDP, AsyncSniffer, IPv6, Raw, conf, sniff
@@ -137,6 +140,9 @@ class NetLog:
         self.alerted: set[tuple] = set()
         # (chi, con chi, servizio) -> [byte inviati, byte ricevuti]
         self.traffic: dict[tuple[str, str, str], list[int]] = defaultdict(lambda: [0, 0])
+        # Per la UI: totali dall'avvio per (chi, IP remoto, servizio) e storico avvisi/dispositivi
+        self.totals: dict[tuple[str, str, str], list[int]] = defaultdict(lambda: [0, 0])
+        self.events: list[dict] = []
         self.procs = ProcessLookup() if live else None
         self.json = open(json_path, "a", encoding="utf-8") if json_path else None
         self.now = time.time()
@@ -146,9 +152,11 @@ class NetLog:
         stamp = datetime.fromtimestamp(self.now).strftime("%H:%M:%S")
         mark = {"avviso": "[!]", "dispositivo": "[+]"}.get(kind, "   ")
         print(f"{stamp} {mark} {text}", flush=True)
+        record = {"ora": datetime.fromtimestamp(self.now).isoformat(timespec="seconds"),
+                  "tipo": kind, "testo": text, **data}
+        if kind != "traffico":
+            self.events.append(record)
         if self.json:
-            record = {"ora": datetime.fromtimestamp(self.now).isoformat(timespec="seconds"),
-                      "tipo": kind, "testo": text, **data}
             self.json.write(json.dumps(record, ensure_ascii=False) + "\n")
             self.json.flush()
 
@@ -166,6 +174,28 @@ class NetLog:
                       f"{who} <-> {remote}: {service} "
                       f"(inviati {human_bytes(up)}, ricevuti {human_bytes(down)})",
                       chi=who, con=remote, servizio=service, inviati=up, ricevuti=down)
+
+    def snapshot(self) -> dict:
+        """Stato per la UI: per ogni programma, con chi ha parlato e quanto."""
+        with self.lock:
+            programs: dict[str, dict] = {}
+            for (who, remote_ip, service), (up, down) in self.totals.items():
+                p = programs.setdefault(who, {"chi": who, "inviati": 0, "ricevuti": 0, "contatti": {}})
+                p["inviati"] += up
+                p["ricevuti"] += down
+                # I nomi si imparano strada facendo: si risolvono qui, cosi' IP diversi
+                # dello stesso sito finiscono nella stessa riga.
+                c = p["contatti"].setdefault((self.describe_remote(remote_ip), service), [0, 0])
+                c[0] += up
+                c[1] += down
+            for p in programs.values():
+                p["contatti"] = sorted(
+                    ({"con": con, "servizio": srv, "inviati": u, "ricevuti": d}
+                     for (con, srv), (u, d) in p["contatti"].items()),
+                    key=lambda c: -(c["inviati"] + c["ricevuti"]))
+            return {"programmi": sorted(programs.values(),
+                                        key=lambda p: -(p["inviati"] + p["ricevuti"])),
+                    "eventi": self.events[-200:]}
 
     # ---------- interpretazione ----------
     def describe_remote(self, ip: str) -> str:
@@ -257,12 +287,53 @@ class NetLog:
 
             counters = self.traffic[(who, remote_label, service)]
             counters[0 if outgoing else 1] += size
+            self.totals[(who, remote, service)][0 if outgoing else 1] += size
 
             if plaintext and payload:
                 self.alert_once(("chiaro", local, remote, rport),
                                 f"{who} comunica IN CHIARO con {remote_label}: {service}. "
                                 f"Chiunque sulla rete puo' leggerne il contenuto.",
                                 chi=who, con=remote_label, servizio=service)
+
+
+UI_PORT = 8765
+
+
+def serve_ui(log: NetLog) -> None:
+    """Pagina web locale: raggiungibile solo da questo PC (127.0.0.1)."""
+    page = Path(__file__).with_name("ui.html").read_bytes()
+    host = f"127.0.0.1:{UI_PORT}"
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            # Rifiuta richieste arrivate con un altro nome host (DNS rebinding da siti web).
+            if self.headers.get("Host") != host:
+                self.send_error(403)
+                return
+            if self.path == "/":
+                body, ctype = page, "text/html; charset=utf-8"
+            elif self.path == "/api/state":
+                body = json.dumps(log.snapshot(), ensure_ascii=False).encode()
+                ctype = "application/json; charset=utf-8"
+            else:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args) -> None:
+            pass
+
+    class Server(ThreadingHTTPServer):
+        # Su Windows il riuso dell'indirizzo lascerebbe aprire la stessa porta a un altro processo.
+        allow_reuse_address = False
+
+    server = Server(("127.0.0.1", UI_PORT), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print(f"Pagina disponibile su http://{host}\n", flush=True)
 
 
 def main() -> int:
@@ -272,6 +343,7 @@ def main() -> int:
     ap.add_argument("--interval", type=float, default=10, help="secondi tra un riepilogo e l'altro")
     ap.add_argument("--json", help="file JSON Lines su cui salvare gli eventi")
     ap.add_argument("--list", action="store_true", help="elenca le interfacce ed esci")
+    ap.add_argument("--ui", action="store_true", help="mostra tutto in una pagina web locale")
     args = ap.parse_args()
 
     if args.list:
@@ -283,6 +355,13 @@ def main() -> int:
     if args.pcap:
         sniff(offline=args.pcap, prn=log.handle, store=False)
         log.report()
+        if args.ui:
+            serve_ui(log)
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                pass
         return 0
 
     if not conf.use_pcap:
@@ -293,6 +372,8 @@ def main() -> int:
 
     sniffer = AsyncSniffer(iface=args.iface, prn=log.handle, store=False)
     sniffer.start()
+    if args.ui:
+        serve_ui(log)
     print(f"In ascolto su {args.iface or conf.iface}. Ctrl+C per fermare.\n", flush=True)
     try:
         while True:

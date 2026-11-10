@@ -72,10 +72,12 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 Turns raw network traffic into a log a non-technical person can read. Learning project: prefer code that is easy to follow over clever code.
 
-**Pipeline** (all in `netlog.py`): packet → local/remote side → enrichment (DNS/SNI/Host name, process, service by port) → Italian sentence. Keep these stages distinct.
+**Pipeline** (all in `netlog.py`): packet → local/remote side → enrichment (DNS/SNI/Host name, process, service by port) → sentence. Keep these stages distinct.
+
+**Files**: `netlog.py` (logic), `messages.py` (every user-facing sentence, Italian and English), `ui.html` (local page; its fixed labels are in its own `TEXT` table), `make_sample.py` (synthetic capture for verification). `netlog_memoria.json` is the user's private baseline: never commit it.
 
 **Conventions**
-- User-facing output is in Italian, without jargon; the protocol name goes in parentheses at most.
+- User-facing output exists in Italian and English, without jargon; the protocol name goes in parentheses at most. Never hardcode a sentence: add it to `messages.py` (or `TEXT` in `ui.html`) in both languages.
 - Code identifiers and this file are in English; comments in Italian.
 - Parse only what travels in clear text. Never attempt to decrypt or to capture on networks the user does not own.
 
@@ -90,4 +92,4 @@ python -m venv .venv; .\.venv\Scripts\pip install -r requirements.txt
 ```
 .\.venv\Scripts\python make_sample.py; .\.venv\Scripts\python netlog.py --pcap sample.pcap
 ```
-Expected: one `[+]` device line (Raspberry Pi), two `[!]` clear-text alerts (HTTP to example.com, Telnet), and a traffic line naming `www.youtube.com` as HTTPS. When adding a new interpretation, add a packet for it to `make_sample.py` first, then make it appear in the output.
+Expected: one `[+]` device line (Raspberry Pi), two `[!]` clear-text alerts (HTTP to example.com, Telnet), and a traffic line naming `www.youtube.com` as HTTPS. Run it with `--lang it` and `--lang en`: same lines, both fully translated. Program identity, novelty memory and listening ports work only in live capture, so check those with a live run (`--ui`). When adding a new interpretation, add a packet for it to `make_sample.py` first, then make it appear in the output.

@@ -34,25 +34,64 @@
 </head>
 <body>
 <main>
-  <h1>Cosa succede sulla tua rete</h1>
-  <div class="muted small" id="status">Caricamento…</div>
+  <h1 data-t="title"></h1>
+  <div class="muted small" id="status">…</div>
 
-  <h2>Da controllare</h2>
+  <h2 data-t="hAlerts"></h2>
   <div id="alerts"></div>
 
-  <h2>Novità rispetto alle volte precedenti</h2>
+  <h2 data-t="hNews"></h2>
   <div id="news"></div>
 
-  <h2>Chi sta usando la rete</h2>
+  <h2 data-t="hPrograms"></h2>
   <div id="programs"></div>
 
-  <h2>Programmi che accettano connessioni</h2>
+  <h2 data-t="hListening"></h2>
   <div id="listening"></div>
 
-  <h2>Dispositivi visti in rete</h2>
+  <h2 data-t="hDevices"></h2>
   <div id="devices"></div>
 </main>
 <script>
+// Testi fissi della pagina nelle due lingue. Le frasi degli eventi arrivano già tradotte da netlog.
+const TEXT = {
+  it: {
+    title: "Cosa succede sulla tua rete",
+    hAlerts: "Da controllare", hNews: "Novità rispetto alle volte precedenti",
+    hPrograms: "Chi sta usando la rete", hListening: "Programmi che accettano connessioni",
+    hDevices: "Dispositivi visti in rete",
+    at: "alle ", noAlerts: "Niente di strano finora.", noNews: "Nessuna novità.",
+    signing: "Firma in verifica", signedBy: "Firmato da ", unsigned: "Nessuna firma digitale valida",
+    talked: (n, up, down) => `Ha parlato con ${n} ${n === 1 ? "destinazione" : "destinazioni"}: ` +
+                             `${up} inviati, ${down} ricevuti.`,
+    noTraffic: "Ancora nessun traffico osservato.",
+    fromLan: "Raggiungibile dagli altri dispositivi della rete, se il firewall lo permette",
+    localOnly: "Raggiungibile solo da questo PC",
+    ports: n => n === 1 ? "porta" : "porte",
+    noListening: "Nessun programma in ascolto (o analisi di un file salvato).",
+    firstSeen: "visto la prima volta alle ", noDevices: "Nessun altro dispositivo visto finora.",
+    updated: "Aggiornato alle ", offline: "netlog non risponde: è ancora in esecuzione?",
+  },
+  en: {
+    title: "What is happening on your network",
+    hAlerts: "Worth checking", hNews: "New since the previous runs",
+    hPrograms: "Who is using the network", hListening: "Programs accepting connections",
+    hDevices: "Devices seen on the network",
+    at: "at ", noAlerts: "Nothing unusual so far.", noNews: "Nothing new.",
+    signing: "Checking signature", signedBy: "Signed by ", unsigned: "No valid digital signature",
+    talked: (n, up, down) => `Talked to ${n} ${n === 1 ? "destination" : "destinations"}: ` +
+                             `${up} sent, ${down} received.`,
+    noTraffic: "No traffic observed yet.",
+    fromLan: "Reachable from other devices on the network, if the firewall allows it",
+    localOnly: "Reachable only from this PC",
+    ports: n => n === 1 ? "port" : "ports",
+    noListening: "No program is listening (or a saved file is being analyzed).",
+    firstSeen: "first seen at ", noDevices: "No other device seen so far.",
+    updated: "Updated at ", offline: "netlog is not responding: is it still running?",
+  },
+};
+let T = TEXT.it;
+
 // Nomi di siti e programmi arrivano dalla rete: si inseriscono sempre con textContent, mai come HTML.
 function el(tag, cls, text) {
   const e = document.createElement(tag);
@@ -73,33 +112,34 @@ function fill(id, nodes, emptyText) {
 }
 
 function render(state) {
+  T = TEXT[state.lingua];
+  document.documentElement.lang = state.lingua;
+  for (const e of document.querySelectorAll("[data-t]")) e.textContent = T[e.dataset.t];
+
   const alerts = state.eventi.filter(e => e.tipo === "avviso").reverse();
   fill("alerts", alerts.map(a => {
     const c = el("div", "card warn");
-    c.append(el("div", "", a.testo), el("div", "muted small", "alle " + time(a.ora)));
+    c.append(el("div", "", a.testo), el("div", "muted small", T.at + time(a.ora)));
     return c;
-  }), "Niente di strano finora.");
+  }), T.noAlerts);
 
   const news = state.eventi.filter(e => e.tipo === "novita").reverse();
   fill("news", news.map(a => {
     const c = el("div", "card");
-    c.append(el("div", "", a.testo), el("div", "muted small", "alle " + time(a.ora)));
+    c.append(el("div", "", a.testo), el("div", "muted small", T.at + time(a.ora)));
     return c;
-  }), "Nessuna novità.");
+  }), T.noNews);
 
   fill("programs", state.programmi.map(p => {
     const c = el("div", "card");
     const n = p.contatti.length;
     c.append(el("div", "who", p.chi));
     if (p.percorso) {
-      const signed = p.firma === null ? "Firma in verifica"
-                   : p.firma ? "Firmato da " + p.firma : "Nessuna firma digitale valida";
+      const signed = p.firma === null ? T.signing : p.firma ? T.signedBy + p.firma : T.unsigned;
       c.append(el("div", "muted small", `${signed} · ${p.percorso}`));
     }
     c.append(
-      el("div", "muted small",
-         `Ha parlato con ${n} ${n === 1 ? "destinazione" : "destinazioni"}: ` +
-         `${bytes(p.inviati)} inviati, ${bytes(p.ricevuti)} ricevuti.`));
+      el("div", "muted small", T.talked(n, bytes(p.inviati), bytes(p.ricevuti))));
     const list = el("ul");
     for (const k of p.contatti) {
       const li = el("li");
@@ -108,7 +148,7 @@ function render(state) {
     }
     c.append(list);
     return c;
-  }), "Ancora nessun traffico osservato.");
+  }), T.noTraffic);
 
   // Raggruppa per programma: chi è raggiungibile dalla rete viene prima ed è evidenziato.
   const byProgram = new Map();
@@ -123,29 +163,25 @@ function render(state) {
     c.append(
       el("div", "who", g.chi),
       el("div", "muted small",
-         (g.dalla_rete
-            ? "Raggiungibile dagli altri dispositivi della rete, se il firewall lo permette"
-            : "Raggiungibile solo da questo PC") +
-         ` · ${n === 1 ? "porta" : "porte"} ${g.porte.join(", ")}`));
+         (g.dalla_rete ? T.fromLan : T.localOnly) + ` · ${T.ports(n)} ${g.porte.join(", ")}`));
     return c;
-  }), "Nessun programma in ascolto (o analisi di un file salvato).");
+  }), T.noListening);
 
   const devices = state.eventi.filter(e => e.tipo === "dispositivo");
   fill("devices", devices.map(d => {
     const c = el("div", "card");
-    c.append(el("div", "", d.testo.replace("Dispositivo visto in rete: ", "")),
-             el("div", "muted small", "visto la prima volta alle " + time(d.ora)));
+    c.append(el("div", "", d.dettaglio), el("div", "muted small", T.firstSeen + time(d.ora)));
     return c;
-  }), "Nessun altro dispositivo visto finora.");
+  }), T.noDevices);
 }
 
 async function refresh() {
   const status = document.getElementById("status");
   try {
     render(await (await fetch("/api/state")).json());
-    status.textContent = "Aggiornato alle " + new Date().toLocaleTimeString("it-IT");
+    status.textContent = T.updated + new Date().toLocaleTimeString(document.documentElement.lang);
   } catch {
-    status.textContent = "netlog non risponde: è ancora in esecuzione?";
+    status.textContent = T.offline;
   }
 }
 refresh();

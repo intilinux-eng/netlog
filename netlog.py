@@ -16,7 +16,9 @@ import argparse
 import ipaddress
 import json
 import queue
+import re
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -107,6 +109,7 @@ class ProcessLookup:
 
     def __init__(self) -> None:
         self.table: dict[tuple[str, int], str] = {}
+        self.paths: dict[str, str] = {}          # nome del programma -> percorso ("" se non leggibile)
         self.updated = 0.0
         self.own_ips = {a.address.split("%")[0]
                         for addrs in psutil.net_if_addrs().values() for a in addrs}
@@ -122,9 +125,37 @@ class ProcessLookup:
                 continue
             proto = "TCP" if c.type == socket.SOCK_STREAM else "UDP"
             try:
-                self.table[(proto, c.laddr.port)] = psutil.Process(c.pid).name()
+                proc = psutil.Process(c.pid)
+                name = self.table[(proto, c.laddr.port)] = proc.name()
             except psutil.Error:
-                pass
+                continue
+            if not self.paths.get(name):
+                try:
+                    self.paths[name] = proc.exe()
+                except (psutil.Error, OSError):
+                    self.paths[name] = ""
+
+    def listening(self) -> list[dict]:
+        """Porte TCP su cui un programma di questo PC aspetta connessioni in arrivo."""
+        try:
+            conns = psutil.net_connections(kind="tcp")
+        except (psutil.Error, OSError):
+            return []
+        ports = {}
+        for c in conns:
+            if c.status != psutil.CONN_LISTEN:
+                continue
+            try:
+                name = psutil.Process(c.pid).name()
+            except psutil.Error:
+                name = "programma sconosciuto"
+            # 127.0.0.1 e ::1 sono raggiungibili solo da questo PC; gli altri indirizzi dalla rete.
+            exposed = not ipaddress.ip_address(c.laddr.ip).is_loopback
+            entry = ports.setdefault((name, c.laddr.port), {
+                "chi": name, "porta": c.laddr.port, "dalla_rete": False,
+                "servizio": SERVICES.get(c.laddr.port, ("", False))[0]})
+            entry["dalla_rete"] = entry["dalla_rete"] or exposed
+        return sorted(ports.values(), key=lambda p: (not p["dalla_rete"], p["chi"].lower(), p["porta"]))
 
     def name(self, ip: str, proto: str, port: int) -> str | None:
         if ip not in self.own_ips:
@@ -152,6 +183,45 @@ def cymru_owners(ips: list[str]) -> dict[str, str]:
     return owners
 
 
+PS_SIGNER = ("$input | ForEach-Object { $s = Get-AuthenticodeSignature -LiteralPath $_; "
+             "\"$_|$($s.Status)|$($s.SignerCertificate.Subject)\" }")
+
+
+class SignerLookup:
+    """Percorso di un programma -> chi lo ha firmato ("" = nessuna firma valida).
+
+    La firma digitale dice chi ha prodotto il file e che nessuno lo ha modificato.
+    La verifica la fa Windows (PowerShell), in un thread a parte perche' e' lenta.
+    """
+
+    def __init__(self) -> None:
+        self.signers: dict[str, str | None] = {}
+        self.pending: queue.Queue[str] = queue.Queue()
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def get(self, path: str) -> str | None:
+        if path not in self.signers:
+            self.signers[path] = None
+            self.pending.put(path)
+        return self.signers[path]
+
+    def run(self) -> None:
+        while True:
+            paths = [self.pending.get()]
+            time.sleep(1)                      # raccoglie piu' percorsi in una sola verifica
+            while not self.pending.empty():
+                paths.append(self.pending.get())
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", PS_SIGNER],
+                                 input="\n".join(paths), capture_output=True, text=True,
+                                 errors="replace").stdout
+            for line in out.splitlines():
+                path, _, rest = line.partition("|")
+                status, _, subject = rest.partition("|")
+                if path in self.signers:
+                    cn = re.search(r'CN=(?:"([^"]+)"|([^,]+))', subject)
+                    self.signers[path] = (cn[1] or cn[2]) if status == "Valid" and cn else ""
+
+
 class OwnerLookup:
     """IP pubblico -> chi lo gestisce (rete proprietaria + DNS inverso).
 
@@ -161,6 +231,7 @@ class OwnerLookup:
 
     def __init__(self) -> None:
         self.labels: dict[str, str | None] = {}
+        self.networks: dict[str, str] = {}       # IP -> solo il nome della rete proprietaria
         self.pending: queue.Queue[str] = queue.Queue()
         self.pool = ThreadPoolExecutor(max_workers=8)
         threading.Thread(target=self.run, daemon=True).start()
@@ -184,6 +255,7 @@ class OwnerLookup:
             for ip in ips:
                 owner = owners.get(ip)
                 if owner:
+                    self.networks[ip] = owner
                     self.labels[ip] = f"server della rete {owner} ({ip})"
                 self.pool.submit(self.reverse_dns, ip, owner)
 
@@ -195,6 +267,9 @@ class OwnerLookup:
         if not host.strip("."):                # alcuni server rispondono con un nome vuoto
             return
         self.labels[ip] = f"{host} (rete {owner})" if owner else host
+
+
+MEMORY_FILE = Path(__file__).with_name("netlog_memoria.json")
 
 
 class NetLog:
@@ -210,13 +285,23 @@ class NetLog:
         self.events: list[dict] = []
         self.procs = ProcessLookup() if live else None
         self.owners = OwnerLookup() if live else None    # un pcap si analizza senza toccare la rete
+        self.signers = SignerLookup() if live else None
+        # Memoria tra un'esecuzione e l'altra (solo dal vivo): serve a riconoscere le novita'.
+        # La prima volta non c'e' nulla con cui confrontare: si impara e basta.
+        self.memory = None
+        self.learning = not MEMORY_FILE.exists()
+        self.dirty = False
+        self.new_programs: set[str] = set()
+        if live:
+            self.memory = ({"programmi": {}, "dispositivi": []} if self.learning
+                           else json.loads(MEMORY_FILE.read_text("utf-8")))
         self.json = open(json_path, "a", encoding="utf-8") if json_path else None
         self.now = time.time()
 
     # ---------- output ----------
     def emit(self, kind: str, text: str, **data) -> None:
         stamp = datetime.fromtimestamp(self.now).strftime("%H:%M:%S")
-        mark = {"avviso": "[!]", "dispositivo": "[+]"}.get(kind, "   ")
+        mark = {"avviso": "[!]", "dispositivo": "[+]", "novita": "[*]"}.get(kind, "   ")
         print(f"{stamp} {mark} {text}", flush=True)
         record = {"ora": datetime.fromtimestamp(self.now).isoformat(timespec="seconds"),
                   "tipo": kind, "testo": text, **data}
@@ -241,12 +326,53 @@ class NetLog:
                       f"(inviati {human_bytes(up)}, ricevuti {human_bytes(down)})",
                       chi=who, con=remote, servizio=service, inviati=up, ricevuti=down)
 
+    def check_news(self) -> None:
+        """Confronta cio' che si vede ora con la memoria delle esecuzioni precedenti."""
+        with self.lock:
+            seen = [(who, remote) for who, remote, _ in self.totals]
+        known_programs = self.memory["programmi"]
+        for who, remote in seen:
+            path = self.procs.paths.get(who)
+            if path is None:                       # non e' un programma di questo PC
+                continue
+            signer = self.signers.get(path) if path else None
+            if path and signer is None:            # firma ancora in verifica: al prossimo giro
+                continue
+            if signer == "":
+                self.alert_once(("firma", path),
+                                f"{who} usa la rete ma non ha una firma digitale valida: "
+                                f"non si puo' verificare chi lo ha prodotto ({path}).", chi=who)
+            if who not in known_programs:
+                known_programs[who] = []
+                self.new_programs.add(who)
+                self.dirty = True
+                if not self.learning:
+                    origin = f"firmato da {signer}" if signer else "senza firma verificata"
+                    self.emit("novita", f"Programma mai visto prima in rete: {who} "
+                                        f"({origin}, {path or 'percorso non leggibile'})", chi=who)
+            network = self.owners.networks.get(remote)
+            if network and network not in known_programs[who]:
+                known_programs[who].append(network)
+                self.dirty = True
+                # Per un programma nuovo ogni rete e' nuova: basta l'avviso sul programma.
+                if not self.learning and who not in self.new_programs:
+                    self.emit("novita", f"{who} ha contattato per la prima volta la rete {network}",
+                              chi=who, rete=network)
+        if self.dirty:
+            MEMORY_FILE.write_text(json.dumps(self.memory, ensure_ascii=False, indent=1), "utf-8")
+            self.dirty = False
+
     def snapshot(self) -> dict:
         """Stato per la UI: per ogni programma, con chi ha parlato e quanto."""
         with self.lock:
             programs: dict[str, dict] = {}
             for (who, remote_ip, service), (up, down) in self.totals.items():
-                p = programs.setdefault(who, {"chi": who, "inviati": 0, "ricevuti": 0, "contatti": {}})
+                if who not in programs:
+                    path = self.procs.paths.get(who) if self.procs else None
+                    programs[who] = {"chi": who, "percorso": path,
+                                     "firma": self.signers.get(path) if path else None,
+                                     "inviati": 0, "ricevuti": 0, "contatti": {}}
+                p = programs[who]
                 p["inviati"] += up
                 p["ricevuti"] += down
                 # I nomi si imparano strada facendo: si risolvono qui, cosi' IP diversi
@@ -261,6 +387,7 @@ class NetLog:
                     key=lambda c: -(c["inviati"] + c["ricevuti"]))
             return {"programmi": sorted(programs.values(),
                                         key=lambda p: -(p["inviati"] + p["ricevuti"])),
+                    "in_ascolto": self.procs.listening() if self.procs else [],
                     "eventi": self.events[-200:]}
 
     # ---------- interpretazione ----------
@@ -300,6 +427,12 @@ class NetLog:
         maker = f"produttore {vendor}" if vendor != mac else "produttore sconosciuto"
         self.emit("dispositivo", f"Dispositivo visto in rete: {ip} ({maker}, MAC {mac})",
                   ip=ip, mac=mac)
+        if self.memory is not None and mac not in self.memory["dispositivi"]:
+            self.memory["dispositivi"].append(mac)
+            self.dirty = True
+            if not self.learning:
+                self.emit("novita", f"Dispositivo mai visto prima su questa rete: {ip} "
+                                    f"({maker}, MAC {mac})", ip=ip, mac=mac)
 
     def handle(self, pkt) -> None:
         with self.lock:
@@ -442,11 +575,15 @@ def main() -> int:
     if args.ui:
         serve_ui(log)
     print(f"In ascolto su {args.iface or conf.iface}. Ctrl+C per fermare.\n", flush=True)
+    if log.learning:
+        print("Prima esecuzione: imparo cosa e' normale su questo PC. "
+              "Le novita' saranno segnalate dalle prossime volte.\n", flush=True)
     try:
         while True:
             time.sleep(args.interval)
             log.now = time.time()
             log.report()
+            log.check_news()
     except KeyboardInterrupt:
         sniffer.stop()
         log.report()

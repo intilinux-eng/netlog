@@ -40,8 +40,14 @@
   <h2>Da controllare</h2>
   <div id="alerts"></div>
 
+  <h2>Novità rispetto alle volte precedenti</h2>
+  <div id="news"></div>
+
   <h2>Chi sta usando la rete</h2>
   <div id="programs"></div>
+
+  <h2>Programmi che accettano connessioni</h2>
+  <div id="listening"></div>
 
   <h2>Dispositivi visti in rete</h2>
   <div id="devices"></div>
@@ -74,11 +80,23 @@ function render(state) {
     return c;
   }), "Niente di strano finora.");
 
+  const news = state.eventi.filter(e => e.tipo === "novita").reverse();
+  fill("news", news.map(a => {
+    const c = el("div", "card");
+    c.append(el("div", "", a.testo), el("div", "muted small", "alle " + time(a.ora)));
+    return c;
+  }), "Nessuna novità.");
+
   fill("programs", state.programmi.map(p => {
     const c = el("div", "card");
     const n = p.contatti.length;
+    c.append(el("div", "who", p.chi));
+    if (p.percorso) {
+      const signed = p.firma === null ? "Firma in verifica"
+                   : p.firma ? "Firmato da " + p.firma : "Nessuna firma digitale valida";
+      c.append(el("div", "muted small", `${signed} · ${p.percorso}`));
+    }
     c.append(
-      el("div", "who", p.chi),
       el("div", "muted small",
          `Ha parlato con ${n} ${n === 1 ? "destinazione" : "destinazioni"}: ` +
          `${bytes(p.inviati)} inviati, ${bytes(p.ricevuti)} ricevuti.`));
@@ -91,6 +109,26 @@ function render(state) {
     c.append(list);
     return c;
   }), "Ancora nessun traffico osservato.");
+
+  // Raggruppa per programma: chi è raggiungibile dalla rete viene prima ed è evidenziato.
+  const byProgram = new Map();
+  for (const l of state.in_ascolto) {
+    const key = l.chi + "|" + l.dalla_rete;
+    if (!byProgram.has(key)) byProgram.set(key, {chi: l.chi, dalla_rete: l.dalla_rete, porte: []});
+    byProgram.get(key).porte.push(l.servizio ? `${l.porta} (${l.servizio})` : String(l.porta));
+  }
+  fill("listening", [...byProgram.values()].map(g => {
+    const c = el("div", g.dalla_rete ? "card warn" : "card");
+    const n = g.porte.length;
+    c.append(
+      el("div", "who", g.chi),
+      el("div", "muted small",
+         (g.dalla_rete
+            ? "Raggiungibile dagli altri dispositivi della rete, se il firewall lo permette"
+            : "Raggiungibile solo da questo PC") +
+         ` · ${n === 1 ? "porta" : "porte"} ${g.porte.join(", ")}`));
+    return c;
+  }), "Nessun programma in ascolto (o analisi di un file salvato).");
 
   const devices = state.eventi.filter(e => e.tipo === "dispositivo");
   fill("devices", devices.map(d => {
